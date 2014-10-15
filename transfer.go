@@ -14,12 +14,16 @@ import (
 )
 
 type Transfer struct {
-	client    *Client
-	hash      [20]byte
-	info      *info
+	client *Client
+	hash   [20]byte
+
+	// These may be nil until we have metadata.
+	// Transfer.loadMetadata() is called to set these fields.
+	info     *info
+	pieces   []*piece
+	bitfield *bitfield
+
 	tracker   tracker
-	pieces    []*piece
-	bitfield  *bitfield
 	announceC chan *announceResponse
 	peers     map[[20]byte]*peer // connected peers
 	stopC     chan struct{}      // all goroutines stop when closed
@@ -64,41 +68,6 @@ func (c *Client) newTransfer(hash [20]byte, tracker string, name string) (*Trans
 	}, nil
 }
 
-func (c *Client) newTransferTorrent(tor *torrent) (*Transfer, error) {
-	t, err := c.newTransfer(tor.Info.Hash, tor.Announce, tor.Info.Name)
-	if err != nil {
-		return nil, err
-	}
-
-	t.info = tor.Info
-
-	files, checkHash, err := prepareFiles(tor.Info, c.config.DownloadDir)
-	if err != nil {
-		return nil, err
-	}
-	t.pieces = newPieces(tor.Info, files)
-	t.bitfield = newBitfield(tor.Info.NumPieces)
-	var percentDone uint32
-	if checkHash {
-		c.log.Notice("Doing hash check...")
-		for _, p := range t.pieces {
-			if err := p.Verify(); err != nil {
-				return nil, err
-			}
-			t.bitfield.SetTo(p.Index, p.OK)
-		}
-		percentDone = t.bitfield.Count() * 100 / t.bitfield.Len()
-		c.log.Noticef("Already downloaded: %d%%", percentDone)
-	}
-	if percentDone == 100 {
-		t.onceCompleted.Do(func() {
-			close(t.completed)
-			t.log.Notice("Download completed")
-		})
-	}
-	return t, nil
-}
-
 func (c *Client) newTransferMagnet(m *magnet) (*Transfer, error) {
 	if len(m.Trackers) == 0 {
 		return nil, errors.New("no tracker in magnet link")
@@ -112,25 +81,80 @@ func (c *Client) newTransferMagnet(m *magnet) (*Transfer, error) {
 	return c.newTransfer(m.InfoHash, m.Trackers[0], name)
 }
 
-func (t *Transfer) InfoHash() [sha1.Size]byte     { return t.info.Hash }
+func (c *Client) newTransferTorrent(tor *torrent) (*Transfer, error) {
+	t, err := c.newTransfer(tor.Info.Hash, tor.Announce, tor.Info.Name)
+	if err != nil {
+		return nil, err
+	}
+	return t, t.loadMetadata(tor.Info)
+}
+
+func (t *Transfer) loadMetadata(info *info) error {
+	t.m.Lock()
+	defer t.m.Unlock()
+
+	files, checkHash, err := prepareFiles(info, t.client.config.DownloadDir)
+	if err != nil {
+		return err
+	}
+
+	t.info = info
+	t.pieces = newPieces(info, files)
+	t.bitfield = newBitfield(info.NumPieces)
+
+	var percentDone uint32
+	if checkHash {
+		t.log.Notice("Doing hash check...")
+		for _, p := range t.pieces {
+			if err := p.Verify(); err != nil {
+				return err
+			}
+			t.bitfield.SetTo(p.Index, p.OK)
+		}
+		percentDone = t.bitfield.Count() * 100 / t.bitfield.Len()
+		t.log.Noticef("Already downloaded: %d%%", percentDone)
+	}
+	if percentDone == 100 {
+		t.onceCompleted.Do(func() {
+			close(t.completed)
+			t.log.Notice("Download completed")
+		})
+	}
+	return nil
+}
+
+func (t *Transfer) InfoHash() [sha1.Size]byte     { return t.hash }
 func (t *Transfer) CompleteNotify() chan struct{} { return t.completed }
+
 func (t *Transfer) Downloaded() int64 {
 	t.m.Lock()
+	defer t.m.Unlock()
+	if t.pieces == nil {
+		return 0
+	}
 	var sum int64
 	for _, p := range t.pieces {
 		if p.OK {
 			sum += int64(p.Length)
 		}
 	}
-	t.m.Unlock()
 	return sum
 }
+
 func (t *Transfer) Uploaded() int64 { return 0 } // TODO
-func (t *Transfer) Left() int64     { return t.info.TotalLength - t.Downloaded() }
+
+func (t *Transfer) Left() int64 {
+	t.m.Lock()
+	defer t.m.Unlock()
+	if t.info == nil {
+		return 0
+	}
+	return t.info.TotalLength - t.Downloaded()
+}
 
 func (t *Transfer) run() {
 	// Start download workers
-	if !t.bitfield.All() {
+	if t.bitfield == nil || !t.bitfield.All() {
 		go t.connecter()
 		go t.peerManager()
 	}
@@ -161,7 +185,7 @@ func (t *Transfer) run() {
 
 func (t *Transfer) announcer() {
 	var startEvent trackerEvent
-	if t.bitfield.All() {
+	if t.bitfield != nil && t.bitfield.All() {
 		startEvent = eventCompleted
 	} else {
 		startEvent = eventStarted
@@ -241,15 +265,15 @@ func openOrAllocate(path string, length int64) (f *os.File, exists bool, err err
 }
 
 func (t *Transfer) Start() {
-	sKey := mse.HashSKey(t.info.Hash[:])
+	sKey := mse.HashSKey(t.hash[:])
 	t.client.transfersM.Lock()
-	t.client.transfers[t.info.Hash] = t
+	t.client.transfers[t.hash] = t
 	t.client.transfersSKey[sKey] = t
 	t.client.transfersM.Unlock()
 	go func() {
 		defer func() {
 			t.client.transfersM.Lock()
-			delete(t.client.transfers, t.info.Hash)
+			delete(t.client.transfers, t.hash)
 			delete(t.client.transfersSKey, sKey)
 			t.client.transfersM.Unlock()
 		}()

@@ -12,15 +12,26 @@ type extensionHandshakeMessage struct {
 	MetadataSize uint32           `bencode:"metadata_size,omitempty"`
 }
 
-func (p *peer) SendExtensionHandshake(m *extensionHandshakeMessage) error {
-	const extensionHandshakeID = 0
-	var buf bytes.Buffer
-	e := bencode.NewEncoder(&buf)
-	err := e.Encode(m)
+// Extension IDs
+const (
+	extensionHandshakeID uint8 = iota
+	extensionMetadataID
+)
+
+var extensionMapping = map[string]uint8{
+	"ut_metadata": extensionMetadataID,
+}
+
+func (p *peer) sendExtensionHandshake() error {
+	m := extensionHandshakeMessage{
+		M: extensionMapping,
+	}
+	p.log.Debugf("Sending extension handshake %+v", m)
+	b, err := bencode.EncodeBytes(&m)
 	if err != nil {
 		return err
 	}
-	return p.sendExtensionMessage(extensionHandshakeID, buf.Bytes())
+	return p.sendExtensionMessage(extensionHandshakeID, b)
 }
 
 func (p *peer) sendExtensionMessage(id byte, payload []byte) error {
@@ -33,17 +44,15 @@ func (p *peer) sendExtensionMessage(id byte, payload []byte) error {
 		BTID:        extensionID,
 		ExtensionID: id,
 	}
-
+	p.log.Debugf("Sending extension message %+v", msg)
 	buf := bytes.NewBuffer(make([]byte, 0, 6+len(payload)))
 	err := binary.Write(buf, binary.BigEndian, msg)
 	if err != nil {
 		return err
 	}
-
 	_, err = buf.Write(payload)
 	if err != nil {
 		return err
 	}
-
 	return binary.Write(p.conn, binary.BigEndian, buf.Bytes())
 }

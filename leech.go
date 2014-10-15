@@ -58,7 +58,10 @@ func (t *Transfer) connecter() {
 func (t *Transfer) connectAndRun(addr *net.TCPAddr) {
 	log := newLogger("peer -> " + addr.String())
 
-	conn, cipher, extensions, peerID, err := dial(addr, !t.client.config.Encryption.DisableOutgoing, t.client.config.Encryption.ForceOutgoing, [8]byte{}, t.info.Hash, t.client.peerID)
+	ourExtensions := [8]byte{}
+	ourExtensions[5] |= 0x10 // BEP 10: Extension Protocol
+
+	conn, cipher, extensions, peerID, err := dial(addr, !t.client.config.Encryption.DisableOutgoing, t.client.config.Encryption.ForceOutgoing, ourExtensions, t.hash, t.client.peerID)
 	if err != nil {
 		if err == errOwnConnection {
 			log.Debug(err)
@@ -85,12 +88,27 @@ func (t *Transfer) connectAndRun(addr *net.TCPAddr) {
 		log.Error(err)
 		return
 	}
+	if err = p.sendExtensionHandshake(); err != nil {
+		log.Error(err)
+		return
+	}
 
 	p.Run()
 }
 
 func (peer *peer) downloader() {
 	t := peer.transfer
+
+	t.m.Lock()
+	for !peer.hasMetadata && !peer.disconnected {
+		peer.cond.Wait()
+	}
+	if peer.disconnected {
+		t.m.Unlock()
+		return
+	}
+	t.m.Unlock()
+
 	for {
 		// Select next piece to download.
 		t.m.Lock()
@@ -118,6 +136,7 @@ func (peer *peer) downloader() {
 			peer.cond.Wait()
 		}
 		if peer.disconnected {
+			t.m.Unlock()
 			return
 		}
 		piece := selectPiece(candidates)
@@ -140,6 +159,10 @@ func (peer *peer) downloader() {
 			for peer.peerChoking && !peer.disconnected {
 				request.resetWaitingRequests()
 				peer.cond.Wait()
+			}
+			if peer.disconnected {
+				t.m.Unlock()
+				return
 			}
 
 			// Select next block that is not requested.

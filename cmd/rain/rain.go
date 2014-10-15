@@ -6,6 +6,7 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/cenkalti/log"
@@ -36,7 +37,7 @@ func main() {
 
 	args := flag.Args()
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "Give a torrent file as first argument!")
+		fmt.Fprintln(os.Stderr, "Give a torrent file or magnet link as first argument!")
 		os.Exit(1)
 	}
 
@@ -80,12 +81,16 @@ func main() {
 		log.Fatal(err)
 	}
 
-	f, err := os.Open(args[0])
-	if err != nil {
-		log.Fatal(err)
+	var t *rain.Transfer
+	if strings.HasPrefix(args[0], "magnet:") {
+		t, err = r.AddMagnet(args[0])
+	} else {
+		f, err := os.Open(args[0])
+		if err != nil {
+			log.Fatal(err)
+		}
+		t, err = r.AddTorrent(f)
 	}
-
-	t, err := r.AddTorrent(f)
 	if err != nil {
 		log.Fatal(err)
 	}
